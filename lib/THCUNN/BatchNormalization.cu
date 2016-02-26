@@ -177,7 +177,8 @@ __global__ void BatchNormalizationUpdateOutput_kernel(
     DeviceTensor1 runningMean,
     DeviceTensor1 runningVar,
     DeviceTensor1 saveMean,
-    DeviceTensor1 saveStd) {
+    DeviceTensor1 saveStd,
+    bool inplace) {
 
   int plane = blockIdx.x;
   int N = input.getSize(0) * input.getSize(2);
@@ -193,19 +194,20 @@ __global__ void BatchNormalizationUpdateOutput_kernel(
     invStd = 1 / sqrt(varN * norm + epsilon);
   }
 
+  float gamma = weight.numElements() > 0 ? weight[plane] : 1.0f;
+  float beta = bias.numElements() > 0 ? bias[plane] : 0.0f;
+
   // Save the mean, variance, and moving averages
   if (threadIdx.x == 0) {
     // Momentum based writeback
     float unbiasedVar = varN / (N - 1);
-    saveMean[plane] = mean;
+    saveMean[plane] = inplace ? beta : mean;
     saveStd[plane] = invStd;
     runningMean[plane] = (1 - momentum) * runningMean[plane] + momentum * mean;
     runningVar[plane] = (1 - momentum) * runningVar[plane] + momentum * unbiasedVar;
   }
 
   // Write normalized and update the output
-  float gamma = weight.numElements() > 0 ? weight[plane] : 1.0f;
-  float beta = bias.numElements() > 0 ? bias[plane] : 0.0f;
   for (int batch = 0; batch < input.getSize(0); ++batch) {
     for (int x = threadIdx.x; x < input.getSize(2); x += blockDim.x) {
       float inp = input[batch][plane][x].ldg();
@@ -228,7 +230,7 @@ void THNN_CudaBatchNormalization_updateOutput(
   THCState *state, THCudaTensor *input_, THCudaTensor *output_,
   THCudaTensor *weight_, THCudaTensor *bias_, THCudaTensor *runningMean_,
   THCudaTensor *runningVar_, THCudaTensor *saveMean_, THCudaTensor *saveStd_,
-  bool train, double momentum, double eps) {
+  bool train, double momentum, double eps, bool inplace) {
 
   DeviceTensor3 input = devicetensor<3>(state, input_);
   DeviceTensor3 output = devicetensor<3>(state, output_);
@@ -252,7 +254,7 @@ void THNN_CudaBatchNormalization_updateOutput(
     dim3 threads(getNumThreads(input.getSize(2)));
     BatchNormalizationUpdateOutput_kernel<<<blocks, threads, 0, s>>>(
       input, output, weight, bias, eps, momentum, runningMean, runningVar,
-      saveMean, saveStd);
+      saveMean, saveStd, inplace);
   }
 }
 
@@ -265,7 +267,8 @@ __global__ void BatchNormalizationBackward_kernel(
     const DeviceTensor1 weight,
     const DeviceTensor1 saveMean,
     const DeviceTensor1 saveStd,
-    float scale) {
+    float scale,
+    bool inplace) {
 
   int plane = blockIdx.x;
   int N = gradOutput.getSize(0) * gradOutput.getSize(2);
@@ -274,16 +277,17 @@ __global__ void BatchNormalizationBackward_kernel(
   float stdVal = saveStd[plane];
   float weightVal = weight.numElements() > 0 ? weight[plane] : 1.0f;
   float norm = 1.0f / N;
+  float inScale = inplace ? (1.0f / weightVal) : stdVal;
 
   // Compute two values across (batch, x/y/z) in one pass:
   // 1. Sum(gradOutput)
   // 2. DotProduct(gradOutput - mean, input)
   Float2 res = reduce<Float2>(GradOp(mean, input, gradOutput), gradOutput, plane);
   float gradOutputSum = res.v1;
-  float dotP = res.v2;
+  float dotP = res.v2 * inScale;
 
   float gradMean = gradOutputSum * norm;
-  float projScale = dotP * norm * stdVal * stdVal;
+  float projScale = dotP * norm * inScale;
   float gradScale = stdVal * weightVal;
 
   if (gradInput.numElements() > 0) {
@@ -300,7 +304,7 @@ __global__ void BatchNormalizationBackward_kernel(
 
   if (gradWeight.numElements() > 0) {
     if (threadIdx.x == 0) {
-      gradWeight[plane] += scale * dotP * stdVal;
+      gradWeight[plane] += scale * dotP;
     }
   }
 
@@ -315,7 +319,7 @@ void THNN_CudaBatchNormalization_backward(
   THCState *state, THCudaTensor *input_, THCudaTensor *gradOutput_,
   THCudaTensor *gradInput_, THCudaTensor *gradWeight_, THCudaTensor *gradBias_,
   THCudaTensor *weight_, THCudaTensor *saveMean_, THCudaTensor *saveStd_,
-  float scale) {
+  float scale, bool inplace) {
 
   DeviceTensor3 input = devicetensor<3>(state, input_);
   DeviceTensor3 gradOutput = devicetensor<3>(state, gradOutput_);
@@ -332,5 +336,5 @@ void THNN_CudaBatchNormalization_backward(
   dim3 threads(getNumThreads(gradOutput.getSize(2)));
   BatchNormalizationBackward_kernel<<<blocks, threads, 0, s>>>(
     input, gradOutput, gradInput, gradWeight, gradBias, weight, saveMean,
-    saveStd, scale);
+    saveStd, scale, inplace);
 }

@@ -6,71 +6,119 @@ local times = {}
 
 --e.g.: th -lcunn -e "nn.testcuda{'Sigmoid_forward'}"
 
-local function pointwise_forward(proto_module, name, max_error)
-   local size = math.random(1,100)
+local function sizeToString(input)
+   return table.concat(input:size():totable(), ' x ')
+end
+
+local function testForward(module, input, opt)
+   opt = opt or {}
+   local moduleGpu = module:clone():cuda()
+   input = input:clone()
+   local inputGpu = input:cuda()
+   local precision = opt.precision or precision_forward
+   local name = opt.name or torch.type(module):gsub('nn.', '')
 
    local tm = {}
-   local title = string.format(name..'.forward %d -> %d', size, size)
+   local title = string.format('%s.forward ', name, sizeToString(input))
    times[title] = tm
 
-   local input = torch.randn(size)
-   if name == 'Sqrt' then input:abs() end
-   local sconv = proto_module
-   local groundtruth = sconv:forward(input)
+   local output = module:forward(input)
    local a = torch.Timer()
-   for i = 1,nloop do
-      groundtruth = sconv:forward(input)
+   for i = 1, nloop do
+      output = module:forward(input)
    end
    tm.cpu = a:time().real
 
-   input = input:cuda()
-   local gconv = proto_module:clone():cuda()
-   local rescuda = gconv:forward(input)
+   local outputGpu = moduleGpu:forward(inputGpu)
+   cutorch.synchronize()
    a:reset()
    for i = 1,nloop do
-      rescuda = gconv:forward(input)
+      outputGpu = moduleGpu:forward(inputGpu)
    end
    cutorch.synchronize()
    tm.gpu = a:time().real
 
-   local error = rescuda:float() - groundtruth
-   mytester:assertlt(error:abs():max(), max_error, 'error on state (forward) ')
+   local error = (outputGpu:float() - output):abs():max()
+   mytester:assertlt(error, precision_forward, 'error on output (forward)')
+   for _, key in ipairs(opt.keys or {}) do
+      local error = (moduleGpu[key]:float() - module[key]):abs():max()
+      mytester:assertlt(error, precision_forward, 'error on ' .. key .. ' (forward)')
+   end
+end
+
+local function testBackward(module, input, gradOutput, opt)
+   opt = opt or {}
+   local moduleGpu = module:clone():cuda()
+   input, gradOutput = input:clone(), gradOutput:clone()
+   local inputGpu, gradOutputGpu = input:cuda(), gradOutput:cuda()
+   local name = opt.name or torch.type(module):gsub('nn.', '')
+   local precision = opt.precision or precision_backward
+
+   local tm = {}
+   local title = string.format('%s.backward ', name, sizeToString(input))
+   times[title] = tm
+
+   local function backward(module, input, gradOutput)
+      if opt.twostep then
+         local gradInput = module:updateGradInput(input, gradOutput)
+         module:accGradParameters(input, gradOutput)
+         return gradInput
+      else
+         return module:backward(input, gradOutput)
+      end
+   end
+
+   module:forward(input)
+   module:zeroGradParameters()
+   local gradInput = backward(module, input, gradOutput)
+   local a = torch.Timer()
+   for i = 1, nloop do
+      gradInput = backward(module, input, gradOutput)
+   end
+   tm.cpu = a:time().real
+
+   moduleGpu:forward(inputGpu)
+   moduleGpu:zeroGradParameters()
+   local gradInputGpu = backward(moduleGpu, inputGpu, gradOutputGpu)
+   cutorch.synchronize()
+   a:reset()
+   for i = 1, nloop do
+      gradInputGpu = backward(moduleGpu, inputGpu, gradOutputGpu)
+   end
+   cutorch.synchronize()
+   tm.gpu = a:time().real
+
+   local error = (gradInputGpu:float() - gradInput):abs():max()
+   mytester:assertlt(error, precision, 'error on gradInput (backward)')
+
+   if module.gradWeight then
+      local error = (moduleGpu.gradWeight:float() - module.gradWeight):abs():max()
+      mytester:assertlt(error, precision, 'error on gradWeight (backward)')
+   end
+
+   if module.gradBias then
+      local error = (moduleGpu.gradBias:float() - module.gradBias):abs():max()
+      mytester:assertlt(error, precision, 'error on gradBias (backward)')
+   end
+
+   for _, key in ipairs(opt.keys or {}) do
+      local error = (moduleGpu[key]:float() - module[key]):abs():max()
+      mytester:assertlt(error, precision, 'error on ' .. key .. ' (backward)')
+   end
+end
+
+local function pointwise_forward(proto_module, name, max_error)
+   local input = torch.randn(math.random(1,100))
+   if name == 'Sqrt' then input:abs() end
+   testForward(proto_module, input, { precision = max_error })
 end
 
 local function pointwise_backward(proto_module, name, max_error)
    local size = math.random(1,100)
-
-   local tm = {}
-   local title = string.format(name..'.backward %d -> %d', size, size)
-   times[title] = tm
-
    local input = torch.randn(size)
-   if name == 'Sqrt' then input:abs() end
    local gradOutput = torch.randn(size)
-   local sconv = proto_module
-   sconv:forward(input)
-   local groundgrad = sconv:backward(input, gradOutput)
-   local a = torch.Timer()
-   for i = 1,nloop do
-      groundgrad = sconv:backward(input, gradOutput)
-   end
-   tm.cpu = a:time().real
-
-   input = input:cuda()
-   gradOutput = gradOutput:cuda()
-   local gconv = proto_module:clone():cuda()
-   gconv:forward(input)
-   local rescuda = gconv:backward(input, gradOutput)
-   a:reset()
-   for i = 1,nloop do
-      rescuda = gconv:backward(input, gradOutput)
-   end
-   cutorch.synchronize()
-   tm.gpu = a:time().real
-
-   local error = rescuda:float() - groundgrad
-
-   mytester:assertlt(error:abs():max(), max_error, 'error on state (backward) ')
+   if name == 'Sqrt' then input:abs() end
+   testBackward(proto_module, input, gradOutput, { precision = max_error })
 end
 
 local function pointwise_transposed(proto_module, name, max_error)
@@ -511,179 +559,47 @@ function cunntest.WeightedEuclidean_backward_batch()
    mytester:assertlt(derror:abs():max(), precision_backward, 'error on diagCov (backward) ')
 end
 
-local function BatchNormalization_forward(moduleName, dim, k)
+local function testBatchNormalization(moduleName, dim, k)
    local planes = torch.random(1,k)
    local inputSize = { torch.random(2,32), planes }
    for i=1,dim do
       table.insert(inputSize, torch.random(1,k))
    end
-
-   local tm = {}
-   local title = moduleName .. '.forward ' .. table.concat(inputSize, 'x')
-   times[title] = tm
-
    local input = torch.randn(table.unpack(inputSize))
-   local sbnorm = nn[moduleName](planes)
-   local groundtruth = sbnorm:forward(input)
-   local a = torch.Timer()
-   for i = 1,nloop do
-      groundtruth = sbnorm:forward(input)
-   end
-   tm.cpu = a:time().real
+   local gradInput = torch.randn(table.unpack(inputSize))
+   local opt = {
+      keys = {'running_mean', 'running_var'}
+   }
 
-   input = input:cuda()
-   local gbnorm = nn[moduleName](planes):cuda()
-   gbnorm.weight = sbnorm.weight:cuda()
-   gbnorm.bias = sbnorm.bias:cuda()
-   local rescuda = gbnorm:forward(input)
+   -- training mode
+   local sbn = nn[moduleName](planes)
+   testForward(sbn, input, opt)
+   testBackward(sbn, input, gradInput)
+   testBackward(sbn, input, gradInput, {twostep=true})
 
-   a:reset()
-   for i = 1,nloop do
-      rescuda = gbnorm:forward(input)
-   end
-   cutorch.synchronize()
-   tm.gpu = a:time().real
+   -- evaluate mode
+   sbn:evaluate()
+   sbn.running_mean:normal(1, 2)
+   sbn.running_var:uniform(1e-3, 2)
+   testForward(sbn, input, opt)
+   sbn:training()
 
-   local error = rescuda:float() - groundtruth
-   mytester:assertlt(error:abs():max(), precision_forward, 'error on state (forward)')
-   mytester:assertlt((gbnorm.running_mean:float() - sbnorm.running_mean):abs():max(),
-      precision_forward, 'error on running_mean (forward)')
-   mytester:assertlt((gbnorm.running_var:float() - sbnorm.running_var):abs():max(),
-      precision_forward, 'error on running_var (forward)')
-end
-
-local function BatchNormalization_forward_inference(moduleName, dim, k)
-   local planes = torch.random(1,k)
-   local inputSize = { torch.random(2,32), planes }
-   for i=1,dim do
-      table.insert(inputSize, torch.random(1,k))
-   end
-
-   local tm = {}
-   local title = moduleName .. '.forward (evaluate) ' .. table.concat(inputSize, 'x')
-   times[title] = tm
-
-   local input = torch.randn(table.unpack(inputSize))
-   local sbnorm = nn[moduleName](planes)
-   sbnorm.running_mean:normal(1, 2)
-   sbnorm.running_var:uniform(1e-3, 2)
-   sbnorm:evaluate()
-   local groundtruth = sbnorm:forward(input)
-   local a = torch.Timer()
-   for i = 1,nloop do
-      groundtruth = sbnorm:forward(input)
-   end
-   tm.cpu = a:time().real
-
-   input = input:cuda()
-   local gbnorm = nn[moduleName](planes):cuda()
-   gbnorm:evaluate()
-   gbnorm.weight = sbnorm.weight:cuda()
-   gbnorm.bias = sbnorm.bias:cuda()
-   gbnorm.running_mean = sbnorm.running_mean:cuda()
-   gbnorm.running_var = sbnorm.running_var:cuda()
-   local rescuda = gbnorm:forward(input)
-   a:reset()
-   for i = 1,nloop do
-      rescuda = gbnorm:forward(input)
-   end
-   cutorch.synchronize()
-   tm.gpu = a:time().real
-
-   local error = rescuda:float() - groundtruth
-   mytester:assertlt(error:abs():max(), precision_forward, 'error on state (forward evaluate)')
-end
-
-local function BatchNormalization_backward(moduleName, dim, k, backwardFn)
-   local planes = torch.random(1,k)
-   local inputSize = { torch.random(2,32), planes }
-   for i=1,dim do
-      table.insert(inputSize, torch.random(1,k))
-   end
-
-   local tm = {}
-   local title = moduleName .. '.backward ' .. table.concat(inputSize, 'x')
-   times[title] = tm
-
-   local input = torch.randn(table.unpack(inputSize))
-   local gradOutput = torch.randn(table.unpack(inputSize))
-   local sbnorm = nn[moduleName](planes)
-   sbnorm:forward(input)
-   sbnorm:zeroGradParameters()
-   local groundgrad = backwardFn(sbnorm, input, gradOutput)
-   local a = torch.Timer()
-   for i = 1,nloop do
-      sbnorm:zeroGradParameters()
-      groundgrad = backwardFn(sbnorm, input, gradOutput)
-   end
-   local groundweight = sbnorm.gradWeight
-   local groundbias = sbnorm.gradBias
-   tm.cpu = a:time().real
-
-   input = input:cuda()
-   gradOutput = gradOutput:cuda()
-   local gbnorm = nn[moduleName](planes):cuda()
-   gbnorm.weight = sbnorm.weight:cuda()
-   gbnorm.bias = sbnorm.bias:cuda()
-   gbnorm:forward(input)
-   gbnorm:zeroGradParameters()
-   local rescuda = backwardFn(gbnorm, input, gradOutput)
-   a:reset()
-   for i = 1,nloop do
-      gbnorm:zeroGradParameters()
-      rescuda = backwardFn(gbnorm, input, gradOutput)
-   end
-   local weightcuda = gbnorm.gradWeight
-   local biascuda = gbnorm.gradBias
-   cutorch.synchronize()
-   tm.gpu = a:time().real
-
-   local error = rescuda:float() - groundgrad
-   local werror = weightcuda:float() - groundweight
-   local berror = biascuda:float() - groundbias
-
-   mytester:assertlt(error:abs():max(), precision_backward, 'error on state (backward) ')
-   mytester:assertlt(werror:abs():max(), precision_backward, 'error on weight (backward) ')
-   mytester:assertlt(berror:abs():max(), precision_backward, 'error on bias (backward) ')
+   -- in-place
+   sbn = nn[moduleName](planes, nil, nil, nil, true)
+   testForward(sbn, input, opt)
+   testBackward(sbn, input, gradInput)
 end
 
 function cunntest.BatchNormalization()
-   BatchNormalization_forward('BatchNormalization', 0, 128)
-   BatchNormalization_forward_inference('BatchNormalization', 0, 128)
-   BatchNormalization_backward('BatchNormalization', 0, 128, function(m, input, gradOutput)
-      return m:backward(input, gradOutput)
-   end)
-   BatchNormalization_backward('BatchNormalization', 0, 128, function(m, input, gradOutput)
-      local gradInput = m:updateGradInput(input, gradOutput)
-      m:accGradParameters(input, gradOutput)
-      return gradInput
-   end)
+   testBatchNormalization('BatchNormalization', 0, 128)
 end
 
 function cunntest.SpatialBatchNormalization()
-   BatchNormalization_forward('SpatialBatchNormalization', 2, 64)
-   BatchNormalization_forward_inference('SpatialBatchNormalization', 2, 64)
-   BatchNormalization_backward('SpatialBatchNormalization', 2, 64, function(m, input, gradOutput)
-      return m:backward(input, gradOutput)
-   end)
-   BatchNormalization_backward('SpatialBatchNormalization', 2, 64, function(m, input, gradOutput)
-      local gradInput = m:updateGradInput(input, gradOutput)
-      m:accGradParameters(input, gradOutput)
-      return gradInput
-   end)
+   testBatchNormalization('SpatialBatchNormalization', 2, 64)
 end
 
 function cunntest.VolumetricBatchNormalization()
-   BatchNormalization_forward('VolumetricBatchNormalization', 3, 16)
-   BatchNormalization_forward_inference('VolumetricBatchNormalization', 3, 16)
-   BatchNormalization_backward('VolumetricBatchNormalization', 3, 16, function(m, input, gradOutput)
-      return m:backward(input, gradOutput)
-   end)
-   BatchNormalization_backward('VolumetricBatchNormalization', 3, 16, function(m, input, gradOutput)
-      local gradInput = m:updateGradInput(input, gradOutput)
-      m:accGradParameters(input, gradOutput)
-      return gradInput
-   end)
+   testBatchNormalization('VolumetricBatchNormalization', 3, 16)
 end
 
 function cunntest.SpatialConvolutionMM_forward_single()

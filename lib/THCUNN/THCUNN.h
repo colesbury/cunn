@@ -400,7 +400,8 @@ TH_API void THNN_CudaBatchNormalization_updateOutput(
           THCudaTensor *saveStd,
           bool train,
           double momentum,
-          double eps);
+          double eps,
+          bool inplace);
 TH_API void THNN_CudaBatchNormalization_backward(
           THCState *state,
           THCudaTensor *input,
@@ -411,7 +412,8 @@ TH_API void THNN_CudaBatchNormalization_backward(
           THCudaTensor *weight,
           THCudaTensor *saveMean,
           THCudaTensor *saveStd,
-          float scale);
+          float scale,
+          bool inplace);
 
 TH_API void THNN_CudaSpatialConvolutionMM_updateOutput(
           THCState *state,
